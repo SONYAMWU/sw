@@ -1,0 +1,2 @@
+[functions.gift-actions]
+verify_jwt = false
