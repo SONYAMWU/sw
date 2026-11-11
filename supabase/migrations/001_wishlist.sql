@@ -82,3 +82,53 @@ create policy image_admin_insert on storage.objects for insert to authenticated 
 create policy image_admin_delete on storage.objects for delete to authenticated using(bucket_id='gift-images' and public.is_admin());
 -- Public bucket intentionally allows viewing gift photos; never upload private photos.
 alter publication supabase_realtime add table public.gifts;
+
+-- One-time administrator setup: only a hash is stored, never the setup link.
+create table private.admin_setup(id boolean primary key default true check(id),email text not null,token_hash text not null,expires_at timestamptz not null,claimed_at timestamptz,used_at timestamptz);
+create table private.used_challenges(nonce uuid primary key,expires_at timestamptz not null);
+alter table private.admin_setup enable row level security;
+alter table private.used_challenges enable row level security;
+create function public.claim_admin_setup(p_hash text) returns text language plpgsql security definer set search_path='' as $$
+declare result text;
+begin
+ update private.admin_setup set claimed_at=now() where token_hash=p_hash and expires_at>now() and used_at is null and (claimed_at is null or claimed_at<now()-interval '5 minutes') returning email into result;
+ if not found then raise exception 'Ссылка недействительна, уже использована или запрос ещё выполняется';end if;
+ return result;
+end;$$;
+create function public.finish_admin_setup(p_hash text,p_user uuid) returns void language plpgsql security definer set search_path='' as $$
+declare expected_email text;
+begin
+ select email into expected_email from private.admin_setup where token_hash=p_hash and used_at is null and expires_at>now() and claimed_at>now()-interval '5 minutes' for update;
+ if not found then raise exception 'Ссылка недействительна';end if;
+ if not exists(select 1 from auth.users where id=p_user and lower(email)=lower(expected_email) and email_confirmed_at is not null) then raise exception 'Неверный аккаунт';end if;
+ insert into private.admins(user_id) values(p_user) on conflict do nothing;
+ update private.admin_setup set used_at=now(),token_hash='' where id=true;
+end;$$;
+create function public.redeem_challenge(p_nonce uuid,p_expiry timestamptz) returns boolean language plpgsql security definer set search_path='' as $$
+begin
+ delete from private.used_challenges where expires_at<now();
+ insert into private.used_challenges values(p_nonce,p_expiry) on conflict do nothing;
+ return found;
+end;$$;
+revoke all on function public.claim_admin_setup(text),public.finish_admin_setup(text,uuid),public.redeem_challenge(uuid,timestamptz) from public,anon,authenticated;
+grant execute on function public.claim_admin_setup(text),public.finish_admin_setup(text,uuid),public.redeem_challenge(uuid,timestamptz) to service_role;
+create index gifts_created_idx on public.gifts(created_at desc);
+create index suggestions_pending_idx on public.suggestions(created_at desc) where status='pending';
+create function private.is_admin() returns boolean language sql stable security definer set search_path='' as $$select exists(select 1 from private.admins where user_id=(select auth.uid()));$$;
+revoke all on function private.is_admin() from public,anon;
+grant usage on schema private to authenticated,service_role;
+grant execute on function private.is_admin() to authenticated,service_role;
+create or replace function public.is_admin() returns boolean language sql stable security invoker set search_path='' as $$select private.is_admin();$$;
+revoke execute on function public.is_admin() from anon;
+revoke all on all tables in schema private from public,anon,authenticated;
+create policy deny_clients on private.admins for all to anon,authenticated using(false) with check(false);
+create policy deny_clients on private.reservations for all to anon,authenticated using(false) with check(false);
+create policy deny_clients on private.rate_limits for all to anon,authenticated using(false) with check(false);
+create policy deny_clients on private.admin_setup for all to anon,authenticated using(false) with check(false);
+create policy deny_clients on private.used_challenges for all to anon,authenticated using(false) with check(false);
+alter policy gifts_insert on public.gifts with check((select public.is_admin()));
+alter policy gifts_update on public.gifts using((select public.is_admin())) with check((select public.is_admin()));
+alter policy gifts_delete on public.gifts using((select public.is_admin()));
+alter policy suggestions_read on public.suggestions using((select public.is_admin()));
+create function public.release_admin_setup(p_hash text) returns void language sql security definer set search_path='' as $$update private.admin_setup set claimed_at=null where token_hash=p_hash and used_at is null;$$; revoke all on function public.release_admin_setup(text) from public,anon,authenticated; grant execute on function public.release_admin_setup(text) to service_role;
+

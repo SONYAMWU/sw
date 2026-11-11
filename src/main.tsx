@@ -83,6 +83,7 @@ function App() {
             />
             <Route path="/cancel" element={<Cancel notify={setNotice} />} />
             <Route path="/admin" element={<Admin notify={setNotice} />} />
+            <Route path="/setup" element={<SetupAdmin notify={setNotice} />} />
             <Route
               path="*"
               element={
@@ -560,6 +561,61 @@ declare global {
   }
 }
 function Captcha({ onToken }: { onToken: (s: string) => void }) {
+  if (import.meta.env.VITE_TURNSTILE_SITE_KEY)
+    return <TurnstileCaptcha onToken={onToken} />;
+  return <ProofChallenge onToken={onToken} />;
+}
+function ProofChallenge({ onToken }: { onToken: (s: string) => void }) {
+  const [state, setState] = useState("Проверяем защиту от спама…"),
+    [attempt, setAttempt] = useState(0),
+    [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let stopped = false;
+    onToken("");
+    setFailed(false);
+    setState("Проверяем защиту от спама…");
+    void (async () => {
+      try {
+        const c = await action("challenge", {});
+        const encoder = new TextEncoder();
+        for (let solution = 0; solution <= 1048576; solution++) {
+          if (stopped) return;
+          const hash = new Uint8Array(
+            await crypto.subtle.digest(
+              "SHA-256",
+              encoder.encode(c.nonce + ":" + solution),
+            ),
+          );
+          if (hash[0] === 0 && hash[1] < 16) {
+            onToken(JSON.stringify({ ...c, solution }));
+            setState("Защита от спама готова");
+            return;
+          }
+        }
+        throw Error("Не удалось завершить проверку.");
+      } catch (e) {
+        if (!stopped) {
+          setFailed(true);
+          setState((e as Error).message);
+        }
+      }
+    })();
+    return () => {
+      stopped = true;
+    };
+  }, [attempt]);
+  return (
+    <div className="proof-status" role="status">
+      <small>{state}</small>
+      {failed && (
+        <button type="button" onClick={() => setAttempt((v) => v + 1)}>
+          Повторить проверку
+        </button>
+      )}
+    </div>
+  );
+}
+function TurnstileCaptcha({ onToken }: { onToken: (s: string) => void }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!import.meta.env.VITE_TURNSTILE_SITE_KEY) return;
@@ -782,6 +838,99 @@ function GiftForm({
             : "Сохранить подарок"}
       </button>
     </form>
+  );
+}
+function SetupAdmin({ notify }: { notify: (s: string) => void }) {
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  const token = params.get("token");
+  return (
+    <section className="admin">
+      <span className="micro">a key to your little archive</span>
+      <h1>
+        make it yours<span>.</span>
+      </h1>
+      <p>
+        Первый вход для Сони. Задайте пароль для управления коллекцией. Личная
+        ссылка используется один раз.
+      </p>
+      {!token ? (
+        <p className="error">
+          Для первого входа нужна ваша личная ссылка настройки.
+        </p>
+      ) : (
+        <form
+          className="login"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            const f = new FormData(e.currentTarget);
+            const password = String(f.get("password"));
+            if (password !== f.get("confirm")) {
+              setError("Пароли не совпадают.");
+              return;
+            }
+            setBusy(true);
+            setError("");
+            try {
+              const { email } = await action("setup", { token, password });
+              const { error } = await db.auth.signInWithPassword({
+                email,
+                password,
+              });
+              if (error)
+                throw Error(
+                  "Аккаунт создан. Войдите с новым паролем на странице управления.",
+                );
+              notify("Ваш аккаунт готов. Можно добавлять подарки.");
+              navigate("/admin", { replace: true });
+            } catch (e) {
+              setError((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <label>
+            Ваш новый пароль
+            <input
+              type="password"
+              name="password"
+              required
+              minLength={12}
+              maxLength={128}
+              autoComplete="new-password"
+            />
+          </label>
+          <small>
+            Не менее 12 символов. Сохраните пароль в менеджере паролей.
+          </small>
+          <label>
+            Повторите пароль
+            <input
+              type="password"
+              name="confirm"
+              required
+              minLength={12}
+              maxLength={128}
+              autoComplete="new-password"
+            />
+          </label>
+          {error && (
+            <p role="alert" className="error">
+              {error}
+            </p>
+          )}
+          <button className="primary" disabled={busy}>
+            {busy ? "Создаём аккаунт…" : "Сохранить пароль и войти"}
+          </button>
+        </form>
+      )}
+      <p>
+        <Link to="/admin">Уже есть аккаунт? Войти ↗</Link>
+      </p>
+    </section>
   );
 }
 function Cancel({ notify }: { notify: (s: string) => void }) {

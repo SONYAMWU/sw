@@ -1,4 +1,4 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient } from "npm:@supabase/supabase-js@2.90.1";
 const env = (name: string) => {
   const value = Deno.env.get(name);
   if (!value) throw Error(`Missing server setting: ${name}`);
@@ -20,6 +20,23 @@ const sha = async (s: string) =>
     ),
     (b) => b.toString(16).padStart(2, "0"),
   ).join("");
+const sign = async (value: string) => {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(
+      Deno.env.get("RATE_LIMIT_SALT") || env("SUPABASE_SERVICE_ROLE_KEY"),
+    ),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return Array.from(
+    new Uint8Array(
+      await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)),
+    ),
+    (b) => b.toString(16).padStart(2, "0"),
+  ).join("");
+};
 function url(value: unknown) {
   if (!value) return "";
   if (typeof value !== "string" || value.length > 2048)
@@ -41,7 +58,10 @@ function text(value: unknown, max: number, required = false) {
 }
 Deno.serve(async (req) => {
   const origin = req.headers.get("origin") || "";
-  const allowed = (Deno.env.get("ALLOWED_ORIGINS") || "")
+  const allowed = (
+    Deno.env.get("ALLOWED_ORIGINS") ||
+    "https://sonyamwu.github.io,http://localhost:5173,http://127.0.0.1:5173"
+  )
     .split(",")
     .map((s) => s.trim());
   if (!origin || !allowed.includes(origin))
@@ -109,7 +129,11 @@ Deno.serve(async (req) => {
       if (e) throw Error(e.message);
       return response({ ok: true });
     }
-    if (!["reserve", "cancel", "suggest"].includes(body.action))
+    if (
+      !["reserve", "cancel", "suggest", "challenge", "setup"].includes(
+        body.action,
+      )
+    )
       return response({ error: "Неизвестное действие" }, 400);
     // Persisted, atomic hourly counter. Store only a rotating salted hash, no raw IP.
     const ip = (
@@ -119,15 +143,18 @@ Deno.serve(async (req) => {
     )
       .split(",")[0]
       .trim();
-    const key = await sha(
-      env("RATE_LIMIT_SALT") +
-        new Date().toISOString().slice(0, 10) +
-        ip +
-        body.action,
-    );
+    const ipHash = await sign(new Date().toISOString().slice(0, 10) + ":" + ip);
+    const key = await sign(ipHash + ":" + body.action);
     const { data: can, error: rateError } = await db.rpc("check_rate", {
       p_key: key,
-      p_limit: body.action === "suggest" ? 5 : 60,
+      p_limit:
+        body.action === "suggest"
+          ? 5
+          : body.action === "setup"
+            ? 10
+            : body.action === "challenge"
+              ? 30
+              : 60,
     });
     if (rateError) throw Error("Не удалось проверить лимит");
     if (!can)
@@ -135,23 +162,148 @@ Deno.serve(async (req) => {
         { error: "Слишком много попыток. Попробуйте через час." },
         429,
       );
-    if (body.action === "suggest") {
-      const verification = await fetch(
-        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-        {
-          method: "POST",
-          body: new URLSearchParams({
-            secret: env("TURNSTILE_SECRET_KEY"),
-            response: String(body.captcha || ""),
-          }),
-        },
-      );
-      const verified = await verification.json();
+    if (body.action === "setup") {
       if (
-        !verified.success ||
-        !allowed.some((o) => new URL(o).hostname === verified.hostname)
+        typeof body.token !== "string" ||
+        !/^[a-f0-9]{64}$/.test(body.token) ||
+        typeof body.password !== "string" ||
+        body.password.length < 12 ||
+        body.password.length > 128
       )
-        return response({ error: "Пройдите проверку от спама ещё раз." }, 400);
+        return response(
+          {
+            error: "Нужна личная ссылка и пароль длиной от 12 до 128 символов.",
+          },
+          400,
+        );
+      const hash = await sha(body.token);
+      const { data: email, error: claimError } = await db.rpc(
+        "claim_admin_setup",
+        { p_hash: hash },
+      );
+      if (claimError || !email)
+        return response(
+          {
+            error:
+              "Ссылка первого входа недействительна, уже использована или запрос ещё выполняется.",
+          },
+          403,
+        );
+      const { data: created, error: createError } =
+        await db.auth.admin.createUser({
+          email,
+          password: body.password,
+          email_confirm: true,
+        });
+      let userId = created.user?.id;
+      if (createError || !userId) {
+        const loginClient = createClient(
+          env("SUPABASE_URL"),
+          env("SUPABASE_ANON_KEY"),
+          { auth: { persistSession: false } },
+        );
+        const { data: existing, error: loginError } =
+          await loginClient.auth.signInWithPassword({
+            email,
+            password: body.password,
+          });
+        if (loginError || !existing.user) {
+          await db.rpc("release_admin_setup", { p_hash: hash });
+          return response(
+            {
+              error:
+                "Не удалось создать аккаунт. Если он уже существует, введите его текущий пароль. Иначе проверьте сложность пароля и повторите.",
+            },
+            400,
+          );
+        }
+        userId = existing.user.id;
+        await loginClient.auth.signOut({ scope: "local" });
+      }
+      const { error: finishError } = await db.rpc("finish_admin_setup", {
+        p_hash: hash,
+        p_user: userId,
+      });
+      if (finishError) {
+        await db.rpc("release_admin_setup", { p_hash: hash });
+        return response(
+          {
+            error:
+              "Аккаунт создан, но доступ ещё не назначен. Обратитесь к настройке проекта.",
+          },
+          500,
+        );
+      }
+      return response({ ok: true, email });
+    }
+    if (body.action === "challenge") {
+      const nonce = crypto.randomUUID(),
+        expires = Date.now() + 10 * 60 * 1000;
+      return response({
+        nonce,
+        expires,
+        signature: await sign(nonce + ":" + expires + ":" + ipHash),
+      });
+    }
+    if (body.action === "suggest") {
+      if (Deno.env.get("TURNSTILE_SECRET_KEY")) {
+        const verification = await fetch(
+          "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+          {
+            method: "POST",
+            body: new URLSearchParams({
+              secret: env("TURNSTILE_SECRET_KEY"),
+              response: String(body.captcha || ""),
+            }),
+          },
+        );
+        const verified = await verification.json();
+        if (
+          !verified.success ||
+          !allowed.some((o) => new URL(o).hostname === verified.hostname)
+        )
+          return response(
+            { error: "Пройдите проверку от спама ещё раз." },
+            400,
+          );
+      } else {
+        let c;
+        try {
+          c = JSON.parse(String(body.captcha || ""));
+        } catch {
+          return response(
+            { error: "Пройдите проверку от спама ещё раз." },
+            400,
+          );
+        }
+        if (
+          typeof c.nonce !== "string" ||
+          !/^[a-f0-9-]{36}$/.test(c.nonce) ||
+          !Number.isSafeInteger(c.expires) ||
+          c.expires < Date.now() ||
+          c.expires > Date.now() + 10 * 60 * 1000 ||
+          !Number.isSafeInteger(c.solution) ||
+          c.solution < 0 ||
+          c.solution > 1048576 ||
+          typeof c.signature !== "string" ||
+          c.signature !==
+            (await sign(c.nonce + ":" + c.expires + ":" + ipHash)) ||
+          !(await sha(c.nonce + ":" + c.solution)).startsWith("000")
+        )
+          return response(
+            { error: "Проверка от спама истекла. Повторите отправку." },
+            400,
+          );
+        const { data: redeemed, error: challengeError } = await db.rpc(
+          "redeem_challenge",
+          { p_nonce: c.nonce, p_expiry: new Date(c.expires).toISOString() },
+        );
+        if (challengeError || !redeemed)
+          return response(
+            { error: "Эта проверка уже использована. Повторите отправку." },
+            400,
+          );
+      }
       const gift = body.gift || {};
       const title = text(gift.title, 120, true),
         description = text(gift.description, 1000),

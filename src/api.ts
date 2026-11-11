@@ -1,11 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
-export const configured = Boolean(
-  import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY,
-);
-export const db = createClient(
-  import.meta.env.VITE_SUPABASE_URL || "https://unconfigured.supabase.co",
-  import.meta.env.VITE_SUPABASE_ANON_KEY || "unconfigured",
-);
+import { publicConfig } from "./public-config";
+const projectUrl = import.meta.env.VITE_SUPABASE_URL || publicConfig.url;
+const publicKey = import.meta.env.VITE_SUPABASE_ANON_KEY || publicConfig.key;
+export const configured = Boolean(projectUrl && publicKey);
+export const db = createClient(projectUrl, publicKey);
 export const categories = [
   "beauty",
   "fashion",

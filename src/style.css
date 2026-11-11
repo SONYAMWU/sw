@@ -1507,3 +1507,15 @@ form select {
     font-size: 6px;
   }
 }
+
+.proof-status {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.proof-status button {
+  font-size: 11px;
+  text-decoration: underline;
+  color: var(--red);
+}
